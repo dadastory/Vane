@@ -16,6 +16,7 @@ export type SearchSettings = {
   baseUrl: string;
   model: string;
   hasApiKey: boolean;
+  apiKey: string;
   effective: boolean;
   revision: number;
 };
@@ -73,13 +74,14 @@ export class SearchSettingsStore {
     }
   }
 
-  private public(saved: Saved): SearchSettings {
+  private configuration(saved: Saved): SearchSettings {
     const hasApiKey = Boolean(saved.encryptedKey);
     return {
       mode: saved.mode,
       baseUrl: saved.baseUrl,
       model: saved.model,
       hasApiKey,
+      apiKey: saved.encryptedKey ? this.decrypt(saved.encryptedKey) : '',
       effective: saved.mode === 'advanced' && Boolean(saved.baseUrl && saved.model && hasApiKey),
       revision: saved.revision,
     };
@@ -101,12 +103,11 @@ export class SearchSettingsStore {
   }
 
   async read(): Promise<SearchSettings> {
-    return this.public(await this.load());
+    return this.configuration(await this.load());
   }
 
-  async resolve(): Promise<SearchSettings & { apiKey: string }> {
-    const saved = await this.load();
-    return { ...this.public(saved), apiKey: saved.encryptedKey ? this.decrypt(saved.encryptedKey) : '' };
+  async resolve(): Promise<SearchSettings> {
+    return this.read();
   }
 
   write(input: SettingsWrite): Promise<SearchSettings> {
@@ -123,13 +124,13 @@ export class SearchSettingsStore {
         const baseUrl = validBaseURL((value.baseUrl ?? '').trim());
         const model = (value.model ?? '').trim();
         const replacement = (value.apiKey ?? '').trim();
-        if (!model || model.length > 256 || /[\r\n]/u.test(model) || replacement.length > 8192 || (!replacement && !current.encryptedKey)) {
+        if (!model || model.length > 256 || /[\r\n]/u.test(model) || replacement.length > 8192 || !replacement) {
           throw new Error('settings_invalid');
         }
         saved = {
           revision: current.revision + 1,
           mode: 'advanced', baseUrl, model,
-          encryptedKey: replacement ? this.encrypt(replacement) : current.encryptedKey,
+          encryptedKey: this.encrypt(replacement),
         };
       }
       const temporary = `${this.path}.${randomBytes(8).toString('hex')}.tmp`;
@@ -148,7 +149,7 @@ export class SearchSettingsStore {
         await rm(temporary, { force: true });
         throw error;
       }
-      return this.public(saved);
+      return this.configuration(saved);
     });
     this.writes = next.catch(() => undefined);
     return next;
