@@ -2,8 +2,7 @@ import { Readability } from '@mozilla/readability';
 import { JSDOM } from 'jsdom';
 import { z } from 'zod';
 import type { RequestConfiguration, RetrievalMode } from './config.js';
-import { fetchPublicPage, postConfiguredJSON, validatePublicURL } from './security.js';
-import type { SearchSettingsStore } from './settings.js';
+import { fetchPublicPage, validatePublicURL } from './security.js';
 
 export type SearchResult = { title: string; url: string; content: string };
 export type SearchFinding = SearchResult & { excerpt?: string };
@@ -28,9 +27,6 @@ const searxngSchema = z.object({
   })).max(100),
 });
 
-const embeddingSchema = z.object({
-  data: z.array(z.object({ index: z.number().int(), embedding: z.array(z.number()) })),
-});
 
 function cosine(left: number[], right: number[]): number {
   if (left.length === 0 || left.length !== right.length) return -1;
@@ -57,11 +53,6 @@ export function rankResults(queryEmbedding: number[], results: SearchResult[], e
     .map(({ result }) => result);
 }
 
-async function embeddings(texts: string[], settings: { baseUrl: string; model: string; apiKey: string }): Promise<number[][]> {
-  const url = new URL(`${settings.baseUrl.replace(/\/$/u, '')}/embeddings`);
-  const parsed = embeddingSchema.parse(await postConfiguredJSON(url, settings.apiKey, { model: settings.model, input: texts }));
-  return parsed.data.sort((left, right) => left.index - right.index).map((item) => item.embedding);
-}
 
 async function discover(query: string, searxngBaseURL: string): Promise<SearchResult[]> {
   const url = new URL('/search', `${searxngBaseURL.replace(/\/$/u, '')}/`);
@@ -90,15 +81,11 @@ function readableExcerpt(page: Awaited<ReturnType<typeof fetchPublicPage>>): str
 export async function searchWeb(
   query: string,
   config: RequestConfiguration,
-  dependencies: { searxngBaseURL: string; settings: SearchSettingsStore },
+  dependencies: { searxngBaseURL: string; embed?: (texts: string[]) => Promise<number[][]> },
 ): Promise<SearchOutput> {
   const normalizedQuery = query.replace(/\s+/gu, ' ').trim();
   if (!normalizedQuery || normalizedQuery.length > 1_000) throw new Error('search_query_invalid');
-  const settings = await dependencies.settings.resolve().catch(() => ({
-    effective: false, baseUrl: '', model: '', apiKey: '',
-  }));
-  const budget = retrievalBudgets[config.mode];
-  if (!settings.effective) {
+  if (config.mode === 'ordinary' || !dependencies.embed) {
     const discovered = (await discover(normalizedQuery, dependencies.searxngBaseURL))
       .slice(0, retrievalBudgets.speed.searchResults);
     const findings = discovered.slice(0, 8);
@@ -114,14 +101,15 @@ export async function searchWeb(
       })),
     };
   }
+  const budget = retrievalBudgets[config.mode];
   const discovered = (await discover(normalizedQuery, dependencies.searxngBaseURL))
     .slice(0, budget.searchResults);
   if (!discovered.length) return { query: normalizedQuery, mode: config.mode, findings: [], sources: [] };
 
   let vectors: number[][];
   try {
-    vectors = await embeddings(
-      [normalizedQuery, ...discovered.map((result) => `${result.title}\n${result.content}`)], settings,
+    vectors = await dependencies.embed(
+      [normalizedQuery, ...discovered.map((result) => `${result.title}\n${result.content}`)],
     );
     if (vectors.length !== discovered.length + 1 || !vectors[0]?.length || vectors.some((vector) => vector.length !== vectors[0]?.length)) {
       throw new Error('embedding_unavailable');

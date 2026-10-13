@@ -5,7 +5,8 @@ export const retrievalModeSchema = z.enum(['speed', 'balanced', 'quality']);
 export type RetrievalMode = z.infer<typeof retrievalModeSchema>;
 
 export type RequestConfiguration = {
-  mode: RetrievalMode;
+  mode: RetrievalMode | 'ordinary';
+  embedding?: { model: string; key: string };
 };
 
 const boundedHeader = (headers: Headers, name: string, maximum = 8_192): string => {
@@ -30,10 +31,20 @@ export function parseRequestConfiguration(
   if (!serviceToken || !credentialsMatch(authorization, `Bearer ${serviceToken}`)) {
     throw new Error('vane_unauthorized');
   }
-  if (headers.has('x-flashyun-embedding-context') || headers.has('x-flashyun-embedding-model')) {
+  if (headers.has('x-flashyun-embedding-context')) {
     throw new Error('vane_configuration_unavailable');
   }
+  const mode = boundedHeader(headers, 'x-flashyun-search-mode', 32);
+  if (mode !== 'ordinary') retrievalModeSchema.parse(mode);
+  const hasModel = headers.has('x-flashyun-embedding-model');
+  const hasKey = headers.has('x-flashyun-embedding-key');
+  if (hasModel !== hasKey) throw new Error('vane_configuration_unavailable');
+  if (!hasModel) return { mode: 'ordinary' };
   return {
-    mode: retrievalModeSchema.parse(boundedHeader(headers, 'x-flashyun-search-mode', 32)),
+    mode: mode === 'ordinary' ? mode : retrievalModeSchema.parse(mode),
+    embedding: {
+      model: boundedHeader(headers, 'x-flashyun-embedding-model', 256),
+      key: boundedHeader(headers, 'x-flashyun-embedding-key', 512),
+    },
   };
 }

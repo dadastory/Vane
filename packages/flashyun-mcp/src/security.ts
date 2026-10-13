@@ -59,35 +59,6 @@ async function pinnedAgent(url: URL): Promise<Dispatcher> {
   });
 }
 
-// This endpoint is selected only by a system administrator. Unlike model-
-// discovered public pages, it may be hosted on the deployment's private LAN.
-export async function postConfiguredJSON(url: URL, authorization: string, body: unknown): Promise<unknown> {
-  if (!['http:', 'https:'].includes(url.protocol)) throw new Error('embedding_unavailable');
-  const dispatcher = new Agent();
-  try {
-    const response = await request(url, {
-      dispatcher, method: 'POST',
-      headers: { authorization: `Bearer ${authorization}`, 'content-type': 'application/json', accept: 'application/json' },
-      body: JSON.stringify(body), headersTimeout: 15_000, bodyTimeout: 30_000,
-    });
-    if (response.statusCode !== 200) {
-      await response.body.dump();
-      throw new Error('embedding_unavailable');
-    }
-    const chunks: Buffer[] = [];
-    let size = 0;
-    for await (const chunk of response.body) {
-      const bytes = Buffer.from(chunk);
-      size += bytes.length;
-      if (size > 4 * 1024 * 1024) throw new Error('embedding_unavailable');
-      chunks.push(bytes);
-    }
-    return JSON.parse(Buffer.concat(chunks).toString('utf8')) as unknown;
-  } finally {
-    await dispatcher.close();
-  }
-}
-
 export type PublicPage = { url: string; contentType: string; body: string };
 
 export async function fetchPublicPage(input: string, signal?: AbortSignal): Promise<PublicPage> {
