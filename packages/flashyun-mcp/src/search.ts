@@ -20,13 +20,16 @@ export const retrievalBudgets = {
 } as const satisfies Record<RetrievalMode, { searchResults: number; pages: number }>;
 
 const searxngSchema = z.object({
-  results: z.array(z.object({
-    title: z.string(),
-    url: z.string().url(),
-    content: z.string().optional(),
-  })).max(100),
+  results: z
+    .array(
+      z.object({
+        title: z.string(),
+        url: z.string().url(),
+        content: z.string().optional(),
+      }),
+    )
+    .max(100),
 });
-
 
 function cosine(left: number[], right: number[]): number {
   if (left.length === 0 || left.length !== right.length) return -1;
@@ -46,48 +49,65 @@ function cosine(left: number[], right: number[]): number {
 
 // Derived from Vane's executeSearch embedding ranking. The adapter keeps the
 // upstream behavior isolated from FlashYun model routing and persistence.
-export function rankResults(queryEmbedding: number[], results: SearchResult[], embeddings: number[][]): SearchResult[] {
+export function rankResults(
+  queryEmbedding: number[],
+  results: SearchResult[],
+  embeddings: number[][],
+): SearchResult[] {
   return results
     .map((result, index) => ({ result, score: cosine(queryEmbedding, embeddings[index] ?? []) }))
     .sort((left, right) => right.score - left.score)
     .map(({ result }) => result);
 }
 
-
-async function discover(query: string, searxngBaseURL: string): Promise<SearchResult[]> {
+async function discover(
+  query: string,
+  searxngBaseURL: string,
+  headers: Record<string, string> = {},
+): Promise<SearchResult[]> {
   const url = new URL('/search', `${searxngBaseURL.replace(/\/$/u, '')}/`);
   url.searchParams.set('format', 'json');
   url.searchParams.set('q', query);
   const response = await fetch(url, {
-    headers: { accept: 'application/json' },
+    headers: { ...headers, accept: 'application/json' },
     signal: AbortSignal.timeout(15_000),
   });
   if (!response.ok) throw new Error('search_backend_unavailable');
   const candidates = searxngSchema.parse(await response.json()).results;
-  const validated = await Promise.allSettled(candidates.map(async (result) => ({
-    title: result.title.trim().slice(0, 300),
-    url: await validatePublicURL(result.url),
-    content: (result.content ?? result.title).trim().slice(0, 2_000),
-  })));
-  return validated.flatMap((result) => result.status === 'fulfilled' ? [result.value] : []);
+  const validated = await Promise.allSettled(
+    candidates.map(async (result) => ({
+      title: result.title.trim().slice(0, 300),
+      url: await validatePublicURL(result.url),
+      content: (result.content ?? result.title).trim().slice(0, 2_000),
+    })),
+  );
+  return validated.flatMap((result) => (result.status === 'fulfilled' ? [result.value] : []));
 }
 
 function readableExcerpt(page: Awaited<ReturnType<typeof fetchPublicPage>>): string {
   if (page.contentType === 'text/plain') return page.body.trim().slice(0, 12_000);
   const document = new JSDOM(page.body, { url: page.url }).window.document;
-  return (new Readability(document).parse()?.textContent ?? '').replace(/\s+/gu, ' ').trim().slice(0, 12_000);
+  return (new Readability(document).parse()?.textContent ?? '')
+    .replace(/\s+/gu, ' ')
+    .trim()
+    .slice(0, 12_000);
 }
 
 export async function searchWeb(
   query: string,
   config: RequestConfiguration,
-  dependencies: { searxngBaseURL: string; embed?: (texts: string[]) => Promise<number[][]> },
+  dependencies: {
+    searxngBaseURL: string;
+    searxngHeaders?: Record<string, string>;
+    embed?: (texts: string[]) => Promise<number[][]>;
+  },
 ): Promise<SearchOutput> {
   const normalizedQuery = query.replace(/\s+/gu, ' ').trim();
   if (!normalizedQuery || normalizedQuery.length > 1_000) throw new Error('search_query_invalid');
   if (config.mode === 'ordinary' || !dependencies.embed) {
-    const discovered = (await discover(normalizedQuery, dependencies.searxngBaseURL))
-      .slice(0, retrievalBudgets.speed.searchResults);
+    const discovered = (
+      await discover(normalizedQuery, dependencies.searxngBaseURL, dependencies.searxngHeaders)
+    ).slice(0, retrievalBudgets.speed.searchResults);
     const findings = discovered.slice(0, 8);
     return {
       query: normalizedQuery,
@@ -102,24 +122,35 @@ export async function searchWeb(
     };
   }
   const budget = retrievalBudgets[config.mode];
-  const discovered = (await discover(normalizedQuery, dependencies.searxngBaseURL))
-    .slice(0, budget.searchResults);
-  if (!discovered.length) return { query: normalizedQuery, mode: config.mode, findings: [], sources: [] };
+  const discovered = (
+    await discover(normalizedQuery, dependencies.searxngBaseURL, dependencies.searxngHeaders)
+  ).slice(0, budget.searchResults);
+  if (!discovered.length)
+    return { query: normalizedQuery, mode: config.mode, findings: [], sources: [] };
 
   let vectors: number[][];
   try {
-    vectors = await dependencies.embed(
-      [normalizedQuery, ...discovered.map((result) => `${result.title}\n${result.content}`)],
-    );
-    if (vectors.length !== discovered.length + 1 || !vectors[0]?.length || vectors.some((vector) => vector.length !== vectors[0]?.length)) {
+    vectors = await dependencies.embed([
+      normalizedQuery,
+      ...discovered.map((result) => `${result.title}\n${result.content}`),
+    ]);
+    if (
+      vectors.length !== discovered.length + 1 ||
+      !vectors[0]?.length ||
+      vectors.some((vector) => vector.length !== vectors[0]?.length)
+    ) {
       throw new Error('embedding_unavailable');
     }
   } catch {
     const findings = discovered.slice(0, 8);
     return {
-      query: normalizedQuery, mode: 'ordinary', findings,
+      query: normalizedQuery,
+      mode: 'ordinary',
+      findings,
       sources: findings.map((finding) => ({
-        title: finding.title, url: finding.url, hostname: new URL(finding.url).hostname,
+        title: finding.title,
+        url: finding.url,
+        hostname: new URL(finding.url).hostname,
         ...(finding.content ? { description: finding.content.slice(0, 300) } : {}),
       })),
     };
@@ -132,7 +163,9 @@ export async function searchWeb(
     const pages = await Promise.allSettled(
       findings.slice(0, budget.pages).map(async (finding) => ({
         url: finding.url,
-        excerpt: readableExcerpt(await fetchPublicPage(finding.url, controller.signal)),
+        excerpt: readableExcerpt(
+          await fetchPublicPage(finding.url, controller.signal, config.network),
+        ),
       })),
     );
     for (const page of pages) {

@@ -1,5 +1,6 @@
 import { timingSafeEqual } from 'node:crypto';
 import { z } from 'zod';
+import { parseSearchNetwork, type SearchNetwork } from './network.js';
 
 export const retrievalModeSchema = z.enum(['speed', 'balanced', 'quality']);
 export type RetrievalMode = z.infer<typeof retrievalModeSchema>;
@@ -7,6 +8,7 @@ export type RetrievalMode = z.infer<typeof retrievalModeSchema>;
 export type RequestConfiguration = {
   mode: RetrievalMode | 'ordinary';
   embedding?: { model: string; key: string };
+  network?: SearchNetwork;
 };
 
 const boundedHeader = (headers: Headers, name: string, maximum = 8_192): string => {
@@ -39,9 +41,13 @@ export function parseRequestConfiguration(
   const hasModel = headers.has('x-flashyun-embedding-model');
   const hasKey = headers.has('x-flashyun-embedding-key');
   if (hasModel !== hasKey) throw new Error('vane_configuration_unavailable');
-  if (!hasModel) return { mode: 'ordinary' };
+  const network = headers.has('x-flashyun-search-network')
+    ? parseSearchNetwork(boundedHeader(headers, 'x-flashyun-search-network'))
+    : undefined;
+  if (!hasModel) return { mode: 'ordinary', ...(network ? { network } : {}) };
   return {
     mode: mode === 'ordinary' ? mode : retrievalModeSchema.parse(mode),
+    ...(network ? { network } : {}),
     embedding: {
       model: boundedHeader(headers, 'x-flashyun-embedding-model', 256),
       key: boundedHeader(headers, 'x-flashyun-embedding-key', 512),

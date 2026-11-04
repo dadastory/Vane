@@ -1,6 +1,7 @@
 import { lookup } from 'node:dns/promises';
 import ipaddr from 'ipaddr.js';
-import { Agent, type Dispatcher, request } from 'undici';
+import { Agent, Pool, ProxyAgent, type Dispatcher, request } from 'undici';
+import type { SearchNetwork } from './network.js';
 
 const MAX_REDIRECTS = 4;
 const MAX_PAGE_BYTES = 2 * 1024 * 1024;
@@ -21,11 +22,13 @@ export function assertPublicURL(url: URL): void {
   if (ipaddr.isValid(hostname)) assertPublicAddress(hostname);
 }
 
-async function publicAddresses(hostname: string): Promise<Array<{ address: string; family: 4 | 6 }>> {
+async function publicAddresses(
+  hostname: string,
+): Promise<Array<{ address: string; family: 4 | 6 }>> {
   const answers = await lookup(hostname, { all: true, verbatim: true });
   const result = answers.map(({ address, family }) => {
     assertPublicAddress(address);
-    return { address, family: family === 6 ? 6 as const : 4 as const };
+    return { address, family: family === 6 ? (6 as const) : (4 as const) };
   });
   if (!result.length) throw new Error('web_content_unavailable');
   return result;
@@ -38,18 +41,47 @@ export async function validatePublicURL(input: string): Promise<string> {
   return url.toString();
 }
 
-async function pinnedAgent(url: URL): Promise<Dispatcher> {
+export async function pinnedAgent(url: URL, network?: SearchNetwork): Promise<Dispatcher> {
   const answers = await publicAddresses(url.hostname);
+  if (network?.enabled) {
+    const answer = answers[0];
+    if (!answer) throw Error('web_content_unavailable');
+    const host = answer.family === 6 ? `[${answer.address}]` : answer.address;
+    const authority = `${host}:${url.port || (url.protocol === 'https:' ? '443' : '80')}`;
+    return new ProxyAgent({
+      uri: network.url,
+      proxyTunnel: true,
+      ...(network.username || network.password
+        ? {
+            token: `Basic ${Buffer.from(`${network.username}:${network.password}`).toString('base64')}`,
+          }
+        : {}),
+      requestTls: { rejectUnauthorized: !network.insecureSkipVerify, servername: url.hostname },
+      proxyTls: { rejectUnauthorized: !network.insecureSkipVerify },
+      // Official dispatcher composition pins CONNECT to the validated public
+      // address. Native Undici still owns proxy auth, sockets, TLS and SNI.
+      clientFactory: (origin, options) =>
+        new Pool(origin, options as Pool.Options).compose(
+          (dispatch) => (options, handler) => dispatch({ ...options, path: authority }, handler),
+        ),
+    });
+  }
   let index = 0;
   return new Agent({
     connect: {
       lookup: (_hostname, options, callback) => {
         if (typeof options === 'object' && options.all) {
-          (callback as unknown as (error: Error | null, addresses: typeof answers) => void)(null, answers);
+          (callback as unknown as (error: Error | null, addresses: typeof answers) => void)(
+            null,
+            answers,
+          );
           return;
         }
         const family = typeof options === 'object' ? options.family : options;
-        const matching = family === 4 || family === 6 ? answers.filter((answer) => answer.family === family) : answers;
+        const matching =
+          family === 4 || family === 6
+            ? answers.filter((answer) => answer.family === family)
+            : answers;
         const answer = matching[index % matching.length];
         index += 1;
         if (!answer) return callback(new Error('web_content_unavailable'), '', 4);
@@ -61,11 +93,15 @@ async function pinnedAgent(url: URL): Promise<Dispatcher> {
 
 export type PublicPage = { url: string; contentType: string; body: string };
 
-export async function fetchPublicPage(input: string, signal?: AbortSignal): Promise<PublicPage> {
+export async function fetchPublicPage(
+  input: string,
+  signal?: AbortSignal,
+  network?: SearchNetwork,
+): Promise<PublicPage> {
   let current = new URL(input);
   for (let redirects = 0; redirects <= MAX_REDIRECTS; redirects += 1) {
     assertPublicURL(current);
-    const dispatcher = await pinnedAgent(current);
+    const dispatcher = await pinnedAgent(current, network);
     try {
       const response = await request(current, {
         dispatcher,
@@ -81,14 +117,18 @@ export async function fetchPublicPage(input: string, signal?: AbortSignal): Prom
         const location = response.headers.location;
         await response.body.dump();
         if (!location || redirects === MAX_REDIRECTS) throw new Error('web_content_unavailable');
-        current = new URL(Array.isArray(location) ? location[0] ?? '' : location, current);
+        current = new URL(Array.isArray(location) ? (location[0] ?? '') : location, current);
         continue;
       }
       if (response.statusCode < 200 || response.statusCode >= 300) {
         await response.body.dump();
         throw new Error('web_content_unavailable');
       }
-      const contentType = String(response.headers['content-type'] ?? '').split(';', 1)[0]?.trim().toLowerCase() ?? '';
+      const contentType =
+        String(response.headers['content-type'] ?? '')
+          .split(';', 1)[0]
+          ?.trim()
+          .toLowerCase() ?? '';
       if (!['text/html', 'application/xhtml+xml', 'text/plain'].includes(contentType)) {
         await response.body.dump();
         throw new Error('web_content_unavailable');

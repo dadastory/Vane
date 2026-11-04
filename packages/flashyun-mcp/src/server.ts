@@ -3,6 +3,7 @@ import { NodeStreamableHTTPServerTransport } from '@modelcontextprotocol/node';
 import { McpServer } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 import { parseRequestConfiguration } from './config.js';
+import { searchNetworkHeaders } from './network.js';
 import { searchWeb } from './search.js';
 import { embedTexts } from './embedding.js';
 
@@ -16,7 +17,13 @@ const serviceToken = required('FLASHYUN_VANE_MCP_TOKEN');
 const searxngBaseURL = required('FLASHYUN_SEARXNG_BASE_URL');
 const litellmBaseURL = required('FLASHYUN_LITELLM_BASE_URL');
 const endpoint = new URL(litellmBaseURL);
-if (endpoint.protocol !== 'http:' || endpoint.username || endpoint.password || endpoint.search || endpoint.hash) {
+if (
+  endpoint.protocol !== 'http:' ||
+  endpoint.username ||
+  endpoint.password ||
+  endpoint.search ||
+  endpoint.hash
+) {
   throw new Error('vane_gateway_configuration_invalid');
 }
 const listenHost = (process.env.FLASHYUN_VANE_LISTEN_HOST ?? '0.0.0.0').trim();
@@ -42,8 +49,22 @@ function createMcpServer(configuration: ReturnType<typeof parseRequestConfigurat
       outputSchema: z.object({
         query: z.string(),
         mode: z.enum(['ordinary', 'speed', 'balanced', 'quality']),
-        findings: z.array(z.object({ title: z.string(), url: z.string(), content: z.string(), excerpt: z.string().optional() })),
-        sources: z.array(z.object({ title: z.string(), url: z.string(), hostname: z.string(), description: z.string().optional() })),
+        findings: z.array(
+          z.object({
+            title: z.string(),
+            url: z.string(),
+            content: z.string(),
+            excerpt: z.string().optional(),
+          }),
+        ),
+        sources: z.array(
+          z.object({
+            title: z.string(),
+            url: z.string(),
+            hostname: z.string(),
+            description: z.string().optional(),
+          }),
+        ),
       }),
       annotations: { readOnlyHint: true, openWorldHint: true },
     },
@@ -52,13 +73,20 @@ function createMcpServer(configuration: ReturnType<typeof parseRequestConfigurat
         const embedding = configuration.embedding;
         const output = await searchWeb(query, configuration, {
           searxngBaseURL,
-          ...(embedding ? { embed: (texts: string[]) => embedTexts(litellmBaseURL, embedding, texts) } : {}),
+          searxngHeaders: searchNetworkHeaders(configuration.network, serviceToken),
+          ...(embedding
+            ? { embed: (texts: string[]) => embedTexts(litellmBaseURL, embedding, texts) }
+            : {}),
         });
-        return { content: [{ type: 'text', text: JSON.stringify(output) }], structuredContent: output };
+        return {
+          content: [{ type: 'text', text: JSON.stringify(output) }],
+          structuredContent: output,
+        };
       } catch (error) {
-        const code = error instanceof Error && /^[a-z_]{1,64}$/u.test(error.message)
-          ? error.message
-          : 'web_search_unavailable';
+        const code =
+          error instanceof Error && /^[a-z_]{1,64}$/u.test(error.message)
+            ? error.message
+            : 'web_search_unavailable';
         return { isError: true, content: [{ type: 'text', text: code }] };
       }
     },
